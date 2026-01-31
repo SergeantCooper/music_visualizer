@@ -66,6 +66,8 @@ int main(int argc, char* argv[])
     SDL_Renderer* renderer = nullptr;
     SDL_Event event;
 
+    ma_result decoderResult = MA_DEVICE_NOT_INITIALIZED;
+    ma_result deviceResult = MA_DEVICE_NOT_INITIALIZED;
     ma_decoder decoder;
     ma_device_config deviceConfig;
     ma_device device;
@@ -88,7 +90,8 @@ int main(int argc, char* argv[])
     fftw_plan plan = fftw_plan_dft_r2c_1d(fftWindow, renderBuffer, out, FFTW_ESTIMATE);
 
     //miniaudio init
-    if(ma_decoder_init_file(/*audio_path*/ argv[1], &decoderConfig, &decoder) != MA_SUCCESS)
+    decoderResult = ma_decoder_init_file(/*audio_path*/ argv[1], &decoderConfig, &decoder);
+    if(decoderResult != MA_SUCCESS)
     {
         std::cerr << "Failed to initialize decoder.\n";
         error = true;
@@ -102,7 +105,8 @@ int main(int argc, char* argv[])
     deviceConfig.dataCallback      = data_callback;
     deviceConfig.pUserData         = &decoder;
 
-    if (ma_device_init(nullptr, &deviceConfig, &device) != MA_SUCCESS) {
+    deviceResult = ma_device_init(nullptr, &deviceConfig, &device);
+    if (deviceResult != MA_SUCCESS) {
         std::cerr << "Failed to open playback device.\n";
         error = true;
         goto cleanup;
@@ -199,8 +203,10 @@ cleanup:
     fftw_destroy_plan(plan);
     fftw_free(out);
 
-    ma_device_uninit(&device);
-    ma_decoder_uninit(&decoder);
+    if(deviceResult == MA_SUCCESS)
+        ma_device_uninit(&device);
+    if(decoderResult == MA_SUCCESS)
+        ma_decoder_uninit(&decoder);
 
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
