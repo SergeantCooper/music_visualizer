@@ -140,6 +140,11 @@ int main(int argc, char* argv[])
         {
             SDL_GetWindowSize(window, &width, &height);
         }
+        else if(event.type == SDL_EVENT_KEY_DOWN)
+        {
+            if(event.key.scancode == SDL_SCANCODE_ESCAPE)
+                break;
+        }
 
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
         SDL_RenderClear(renderer);
