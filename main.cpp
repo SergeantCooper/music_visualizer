@@ -6,6 +6,7 @@
 #include <numbers>
 #include <fftw3.h>
 #include <vector>
+#include <array>
 
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
@@ -13,11 +14,12 @@
 int width = 800;
 int height = 600;
 
-constexpr int fftWindow = 1024;
-constexpr int fftBin = (fftWindow / 2) + 1;
+constexpr size_t fftWindow = 1024;
+constexpr size_t fftBin = (fftWindow / 2) + 1;
 
-constexpr int nBars = 64;
-constexpr int nBinsPerBar = fftBin / nBars;
+constexpr size_t nBars = 64;
+constexpr size_t nMirror = fftWindow + 2;
+constexpr size_t nBinsPerBar = nMirror / nBars;
 
 constexpr float MIN_DB = -60.0f;
 constexpr float MAX_DB = 0.0f;
@@ -162,12 +164,27 @@ int main(int argc, char* argv[])
 
             fftw_execute(plan);
 
+            std::vector<std::array<double,2>> fft(nMirror);
+            for(size_t i = 0; i < nMirror; i++)
+            {
+                if(i < fftBin)
+                {
+                    fft[i][0] = out[i][0];
+                    fft[i][1] = out[i][1];
+                }
+                else
+                {
+                    fft[i][0] = out[fftWindow - i + 1][0];
+                    fft[i][1] = -out[fftWindow - i + 1][1];
+                }
+            }
+
             float barWidth = (float)width / nBars;
-            for(int i = 0; i < nBars; i++) {
+            for(size_t i = 0; i < nBars; i++) {
                 double mag = 0;
-                for(int j = 0; j < nBinsPerBar; j++) {
-                    double r = out[i * nBinsPerBar + j][0];
-                    double img = out[i * nBinsPerBar + j][1];
+                for(size_t j = 0; j < nBinsPerBar; j++) {
+                    double r = fft[i * nBinsPerBar + j][0];
+                    double img = fft[i * nBinsPerBar + j][1];
                     mag += std::sqrt(r*r + img*img);
                 }
                 mag /= nBinsPerBar;
