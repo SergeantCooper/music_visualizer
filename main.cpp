@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <iostream>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -18,8 +19,7 @@ constexpr size_t fftWindow = 1024;
 constexpr size_t fftBin = (fftWindow / 2) + 1;
 
 constexpr size_t nBars = 64;
-constexpr size_t nMirror = fftWindow + 2;
-constexpr size_t nBinsPerBar = nMirror / nBars;
+constexpr float MIN_FREQ = 30.0f;
 
 constexpr float MIN_DB = -60.0f;
 constexpr float MAX_DB = 0.0f;
@@ -77,6 +77,7 @@ int main(int argc, char* argv[])
 
     std::vector<double> hannTable(fftWindow);
     std::vector<float> barHeights(nBars, 0);
+    std::array<size_t, nBars + 1> bandEdges{};
 
     for(size_t i = 0; i < fftWindow; i++) {
         hannTable[i] = 0.5f * (1.0f - std::cos((2.0f * std::numbers::pi_v<double> * i) / (fftWindow - 1)));
@@ -135,6 +136,24 @@ int main(int argc, char* argv[])
         goto cleanup;
     }
 
+    // Log-spaced band edges, so every bar covers the same musical interval.
+    // Linear spacing would cram all the music into the first few bars.
+    {
+        double sampleRate = decoder.outputSampleRate;
+        double ratio = (sampleRate / 2.0) / MIN_FREQ;
+
+        for(size_t i = 0; i <= nBars; i++) {
+            double freq = MIN_FREQ * std::pow(ratio, (double)i / nBars);
+            size_t bin = (size_t)std::lround(freq * fftWindow / sampleRate);
+
+            // the lowest bands all round to the same bin, so force them apart
+            if(i > 0 && bin <= bandEdges[i - 1])
+                bin = bandEdges[i - 1] + 1;
+
+            bandEdges[i] = std::min(bin, fftBin - 1);
+        }
+    }
+
     while(1)
     {
         SDL_PollEvent(&event);
@@ -164,30 +183,20 @@ int main(int argc, char* argv[])
 
             fftw_execute(plan);
 
-            std::vector<std::array<double,2>> fft(nMirror);
-            for(size_t i = 0; i < nMirror; i++)
-            {
-                if(i < fftBin)
-                {
-                    fft[i][0] = out[i][0];
-                    fft[i][1] = out[i][1];
-                }
-                else
-                {
-                    fft[i][0] = out[fftWindow - i + 1][0];
-                    fft[i][1] = -out[fftWindow - i + 1][1];
-                }
-            }
+            // fftWindow/4 = fftWindow/2 for the transform, halved again for the
+            // Hann window's coherent gain. A full-scale sine now lands at 0 dB.
+            constexpr double magScale = fftWindow / 4.0;
 
             float barWidth = (float)width / nBars;
             for(size_t i = 0; i < nBars; i++) {
+                // peak rather than average: the upper bands are dozens of bins
+                // wide, and averaging them flattens every transient out
                 double mag = 0;
-                for(size_t j = 0; j < nBinsPerBar; j++) {
-                    double r = fft[i * nBinsPerBar + j][0];
-                    double img = fft[i * nBinsPerBar + j][1];
-                    mag += std::sqrt(r*r + img*img);
+                for(size_t j = bandEdges[i]; j < bandEdges[i + 1]; j++) {
+                    double r = out[j][0];
+                    double img = out[j][1];
+                    mag = std::max(mag, std::sqrt(r*r + img*img) / magScale);
                 }
-                mag /= nBinsPerBar;
 
                 float dbValue = 20.0f * std::log10(mag + 1e-6f);
 
@@ -195,15 +204,13 @@ int main(int argc, char* argv[])
                 normalized = std::clamp(normalized, 0.0f, 1.0f);
                 normalized *= normalized;
 
-                float targetHeight = normalized * (height / 2.0f) * 0.8f;
+                float targetHeight = normalized * height * 0.9f;
                 barHeights[i] += (targetHeight - barHeights[i]) * 0.2f;
                 float renderHeight = barHeights[i];
 
-                float startY = (height / 2.0f) - renderHeight;
-
                 SDL_FRect bar = {
                     (float)i * barWidth,
-                    startY,
+                    (float)height - renderHeight, // grow up from the bottom edge
                     std::max(1.0f, barWidth - 2.0f), // -2 for a small gap between bars
                     renderHeight
                 };
