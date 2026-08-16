@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -25,10 +26,25 @@ constexpr float MIN_DB = -60.0f;
 constexpr float MAX_DB = 0.0f;
 constexpr float DB_RANGE = MAX_DB - MIN_DB;
 
-float audioBuffer[fftWindow] = {0};
+// How quickly a bar chases its target, as a time constant in seconds.
+// Expressed this way the decay looks the same at 60Hz and at 144Hz.
+constexpr float SMOOTH_TAU = 0.06f;
+
+// Touched only by the audio thread.
+float audioRing[fftWindow] = {0};
+size_t ringWrite = 0;
+
+// Touched only by the render thread.
 double renderBuffer[fftWindow] = {0};
 
-std::atomic<size_t> filledSize{0};
+// The handoff between the two. The audio thread publishes the most recent
+// fftWindow samples under a seqlock; an odd sequence number means a write is
+// in flight, so the reader retries. Elements are atomic so that a read racing
+// the writer is merely stale rather than undefined behaviour.
+std::atomic<float> snapshot[fftWindow] = {};
+std::atomic<uint32_t> snapshotSeq{0};
+
+std::atomic<bool> playbackFinished{false};
 
 void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount)
 {
@@ -39,12 +55,20 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
         return;
     }
 
-    ma_decoder_read_pcm_frames(pDecoder, pOutput, frameCount, NULL);
+    ma_uint64 framesRead = 0;
+    ma_decoder_read_pcm_frames(pDecoder, pOutput, frameCount, &framesRead);
 
     float* pOut = (float*)(pOutput);
     size_t nChannels = pDecoder->outputChannels;
 
-    size_t writeIdx = filledSize.load(std::memory_order_relaxed);
+    // A short read means the file ran out. Silence whatever the decoder left
+    // untouched, otherwise the tail of the last buffer plays as garbage.
+    if(framesRead < frameCount)
+    {
+        std::fill(pOut + framesRead * nChannels, pOut + (size_t)frameCount * nChannels, 0.0f);
+        playbackFinished.store(true, std::memory_order_relaxed);
+    }
+
     for(size_t i = 0; i < frameCount; ++i)
     {
         float mono = 0;
@@ -54,19 +78,31 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
         }
         mono /= nChannels;
 
-        audioBuffer[writeIdx] = mono;
-        writeIdx = (writeIdx + 1) % fftWindow;
+        audioRing[ringWrite] = mono;
+        ringWrite = (ringWrite + 1) % fftWindow;
     }
-    filledSize.store(writeIdx ,std::memory_order_release);
+
+    // Publish the ring, oldest sample first, so the reader gets a coherent
+    // window instead of one being overwritten underneath it.
+    uint32_t seq = snapshotSeq.load(std::memory_order_relaxed);
+    snapshotSeq.store(seq + 1, std::memory_order_release);
+    for(size_t i = 0; i < fftWindow; i++)
+    {
+        snapshot[i].store(audioRing[(ringWrite + i) % fftWindow], std::memory_order_relaxed);
+    }
+    snapshotSeq.store(seq + 2, std::memory_order_release);
 }
 
 int main(int argc, char* argv[])
 {
     bool error = false;
+    bool running = true;
 
     SDL_Window* window = nullptr;
     SDL_Renderer* renderer = nullptr;
-    SDL_Event event;
+    SDL_Event event{};
+
+    uint64_t prevTicks = 0;
 
     ma_result decoderResult = MA_DEVICE_NOT_INITIALIZED;
     ma_result deviceResult = MA_DEVICE_NOT_INITIALIZED;
@@ -90,6 +126,12 @@ int main(int argc, char* argv[])
     }
 
     fftw_complex* out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * fftBin);
+    if(out == nullptr)
+    {
+        std::cerr << "Failed to allocate FFT output buffer.\n";
+        return 1;
+    }
+
     fftw_plan plan = fftw_plan_dft_r2c_1d(fftWindow, renderBuffer, out, FFTW_ESTIMATE);
 
     //miniaudio init
@@ -130,6 +172,11 @@ int main(int argc, char* argv[])
         goto cleanup;
     }
 
+    // Without this the loop spins as fast as the CPU allows, re-running the
+    // FFT thousands of times a second for no visible benefit.
+    if(!SDL_SetRenderVSync(renderer, 1))
+        SDL_Log("Couldn't enable vsync, falling back to an unthrottled loop: %s", SDL_GetError());
+
     if (ma_device_start(&device) != MA_SUCCESS) {
         std::cerr << "Failed to start playback device.\n";
         error = true;
@@ -154,31 +201,57 @@ int main(int argc, char* argv[])
         }
     }
 
-    while(1)
+    prevTicks = SDL_GetTicksNS();
+
+    while(running)
     {
-        SDL_PollEvent(&event);
-        if(event.type == SDL_EVENT_QUIT)
+        // Drain the queue. Polling once per frame leaves events to pile up,
+        // and leaves `event` holding a stale value when the queue is empty.
+        while(SDL_PollEvent(&event))
         {
-            break;
+            if(event.type == SDL_EVENT_QUIT)
+            {
+                running = false;
+            }
+            else if(event.type == SDL_EVENT_WINDOW_RESIZED)
+            {
+                SDL_GetWindowSize(window, &width, &height);
+            }
+            else if(event.type == SDL_EVENT_KEY_DOWN)
+            {
+                if(event.key.scancode == SDL_SCANCODE_ESCAPE)
+                    running = false;
+            }
         }
-        else if(event.type == SDL_EVENT_WINDOW_RESIZED)
-        {
-            SDL_GetWindowSize(window, &width, &height);
-        }
-        else if(event.type == SDL_EVENT_KEY_DOWN)
-        {
-            if(event.key.scancode == SDL_SCANCODE_ESCAPE)
-                break;
-        }
+
+        if(playbackFinished.load(std::memory_order_relaxed))
+            running = false;
+
+        uint64_t nowTicks = SDL_GetTicksNS();
+        float dt = (float)(nowTicks - prevTicks) / 1e9f;
+        prevTicks = nowTicks;
+        dt = std::clamp(dt, 0.0f, 0.1f); // don't let a stall snap every bar at once
+
+        float smoothing = 1.0f - std::exp(-dt / SMOOTH_TAU);
 
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
         SDL_RenderClear(renderer);
 
         {
-            size_t currentIdx = filledSize.load(std::memory_order_acquire);
-            for(size_t i = 0; i < fftWindow; i++) {
-                size_t readIdx = (currentIdx + i) % fftWindow;
-                renderBuffer[i] = (double)audioBuffer[readIdx] * hannTable[i];
+            // Seqlock read: retry while the audio thread is mid-publish. The
+            // cap keeps a preempted writer from stalling the frame; the worst
+            // case is one visibly torn window.
+            for(int attempt = 0; attempt < 8; attempt++)
+            {
+                uint32_t before = snapshotSeq.load(std::memory_order_acquire);
+                if(before & 1u)
+                    continue;
+
+                for(size_t i = 0; i < fftWindow; i++)
+                    renderBuffer[i] = (double)snapshot[i].load(std::memory_order_relaxed) * hannTable[i];
+
+                if(snapshotSeq.load(std::memory_order_acquire) == before)
+                    break;
             }
 
             fftw_execute(plan);
@@ -205,7 +278,7 @@ int main(int argc, char* argv[])
                 normalized *= normalized;
 
                 float targetHeight = normalized * height * 0.9f;
-                barHeights[i] += (targetHeight - barHeights[i]) * 0.2f;
+                barHeights[i] += (targetHeight - barHeights[i]) * smoothing;
                 float renderHeight = barHeights[i];
 
                 SDL_FRect bar = {
