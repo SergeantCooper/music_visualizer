@@ -16,19 +16,32 @@
 int width = 800;
 int height = 600;
 
-constexpr size_t fftWindow = 1024;
+// 4096 puts each bin at ~10.8Hz, which is what log-spaced bands need at the
+// bottom end: at 1024 the lowest forty bars were a single bin wide apiece and
+// showed no real detail. The cost is a ~93ms window, still short enough that
+// a kick reads as a hit rather than a smear.
+constexpr size_t fftWindow = 4096;
 constexpr size_t fftBin = (fftWindow / 2) + 1;
 
 constexpr size_t nBars = 64;
-constexpr float MIN_FREQ = 30.0f;
+constexpr float MIN_FREQ = 40.0f;
 
 constexpr float MIN_DB = -60.0f;
 constexpr float MAX_DB = 0.0f;
 constexpr float DB_RANGE = MAX_DB - MIN_DB;
 
-// How quickly a bar chases its target, as a time constant in seconds.
-// Expressed this way the decay looks the same at 60Hz and at 144Hz.
-constexpr float SMOOTH_TAU = 0.06f;
+// Music falls off at roughly -3dB per octave, so an untilted display leaves
+// every treble bar pinned to the floor. Tilt back up to even it out.
+constexpr float TILT_DB_PER_OCTAVE = 3.0f;
+
+// Time constants in seconds. Snapping up and easing down is what makes a
+// visualiser feel like it's hitting the beat; a single constant blunts every
+// transient. Expressed as time so the motion matches at 60Hz and 144Hz.
+constexpr float ATTACK_TAU = 0.01f;
+constexpr float RELEASE_TAU = 0.15f;
+
+// Falling peak markers, in pixels per second squared.
+constexpr float PEAK_GRAVITY = 900.0f;
 
 // Touched only by the audio thread.
 float audioRing[fftWindow] = {0};
@@ -113,7 +126,10 @@ int main(int argc, char* argv[])
 
     std::vector<double> hannTable(fftWindow);
     std::vector<float> barHeights(nBars, 0);
+    std::vector<float> peakHeights(nBars, 0);
+    std::vector<float> peakFall(nBars, 0);
     std::array<size_t, nBars + 1> bandEdges{};
+    std::array<float, nBars> bandTilt{};
 
     for(size_t i = 0; i < fftWindow; i++) {
         hannTable[i] = 0.5f * (1.0f - std::cos((2.0f * std::numbers::pi_v<double> * i) / (fftWindow - 1)));
@@ -177,6 +193,9 @@ int main(int argc, char* argv[])
     if(!SDL_SetRenderVSync(renderer, 1))
         SDL_Log("Couldn't enable vsync, falling back to an unthrottled loop: %s", SDL_GetError());
 
+    // Without this the alpha on the peak markers is ignored outright.
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+
     if (ma_device_start(&device) != MA_SUCCESS) {
         std::cerr << "Failed to start playback device.\n";
         error = true;
@@ -198,6 +217,11 @@ int main(int argc, char* argv[])
                 bin = bandEdges[i - 1] + 1;
 
             bandEdges[i] = std::min(bin, fftBin - 1);
+        }
+
+        for(size_t i = 0; i < nBars; i++) {
+            double centre = MIN_FREQ * std::pow(ratio, (i + 0.5) / nBars);
+            bandTilt[i] = TILT_DB_PER_OCTAVE * (float)std::log2(centre / MIN_FREQ);
         }
     }
 
@@ -232,7 +256,8 @@ int main(int argc, char* argv[])
         prevTicks = nowTicks;
         dt = std::clamp(dt, 0.0f, 0.1f); // don't let a stall snap every bar at once
 
-        float smoothing = 1.0f - std::exp(-dt / SMOOTH_TAU);
+        float attack = 1.0f - std::exp(-dt / ATTACK_TAU);
+        float release = 1.0f - std::exp(-dt / RELEASE_TAU);
 
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0);
         SDL_RenderClear(renderer);
@@ -271,25 +296,59 @@ int main(int argc, char* argv[])
                     mag = std::max(mag, std::sqrt(r*r + img*img) / magScale);
                 }
 
-                float dbValue = 20.0f * std::log10(mag + 1e-6f);
+                float dbValue = 20.0f * std::log10(mag + 1e-6f) + bandTilt[i];
 
                 float normalized = (dbValue - MIN_DB) / DB_RANGE;
                 normalized = std::clamp(normalized, 0.0f, 1.0f);
                 normalized *= normalized;
 
                 float targetHeight = normalized * height * 0.9f;
-                barHeights[i] += (targetHeight - barHeights[i]) * smoothing;
+                float coeff = (targetHeight > barHeights[i]) ? attack : release;
+                barHeights[i] += (targetHeight - barHeights[i]) * coeff;
                 float renderHeight = barHeights[i];
 
+                float x = (float)i * barWidth;
+                float barW = std::max(1.0f, barWidth - 2.0f); // -2 for a small gap between bars
+
                 SDL_FRect bar = {
-                    (float)i * barWidth,
+                    x,
                     (float)height - renderHeight, // grow up from the bottom edge
-                    std::max(1.0f, barWidth - 2.0f), // -2 for a small gap between bars
+                    barW,
                     renderHeight
                 };
 
-                SDL_SetRenderDrawColor(renderer, 43, 201, 88, 255);
+                // Green through the bass, cooling to blue at the top end, so
+                // the sweep of the spectrum is readable at a glance.
+                float t = (float)i / (nBars - 1);
+                SDL_SetRenderDrawColor(renderer,
+                                       (Uint8)(43 + t * (60 - 43)),
+                                       (Uint8)(201 + t * (130 - 201)),
+                                       (Uint8)(88 + t * (240 - 88)),
+                                       255);
                 SDL_RenderFillRect(renderer, &bar);
+
+                // Peak marker: parks at the highest recent value, then falls
+                // away under gravity until the bar catches up with it again.
+                if(renderHeight >= peakHeights[i])
+                {
+                    peakHeights[i] = renderHeight;
+                    peakFall[i] = 0.0f;
+                }
+                else
+                {
+                    peakFall[i] += PEAK_GRAVITY * dt;
+                    peakHeights[i] = std::max(peakHeights[i] - peakFall[i] * dt, renderHeight);
+                }
+
+                SDL_FRect cap = {
+                    x,
+                    (float)height - peakHeights[i] - 2.0f,
+                    barW,
+                    2.0f
+                };
+
+                SDL_SetRenderDrawColor(renderer, 235, 245, 255, 200);
+                SDL_RenderFillRect(renderer, &cap);
             }
         }
 
