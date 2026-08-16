@@ -5,6 +5,14 @@ project(music_visualizer LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Plain `cmake ..` leaves this empty, which means no optimization flags at all.
+# Default to Release so the obvious invocation doesn't produce a debug build.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+    Debug Release RelWithDebInfo MinSizeRel)
+
 find_package(SDL3 CONFIG REQUIRED)
 find_package(PkgConfig REQUIRED)
 
